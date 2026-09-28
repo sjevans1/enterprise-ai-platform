@@ -47,6 +47,7 @@ RUN pip install --no-cache-dir "uvicorn[standard]>=0.29" \
         "openpyxl>=3.1" \
         "beautifulsoup4>=4.12" \
         "lxml>=5.0" \
+        "sqlglot>=25.0" \
         "chardet>=5.0"
 
 # ── Application stage ────────────────────────────────────────────────

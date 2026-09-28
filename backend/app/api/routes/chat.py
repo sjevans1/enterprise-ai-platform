@@ -108,6 +108,41 @@ async def create_conversation(
     return {"conversation_id": conv_id, "title": conv.title}
 
 
+@router.get("/conversations/{conversation_id}/messages")
+async def get_conversation_messages(
+    conversation_id: str,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return persisted messages for one conversation owned by the caller."""
+    stmt = (
+        select(Conversation)
+        .options(selectinload(Conversation.messages))
+        .where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == current_user.id,
+            Conversation.is_deleted.is_(False),
+        )
+    )
+    result = await db.execute(stmt)
+    conversation = result.scalars().first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return {
+        "conversation_id": conversation.id,
+        "messages": [
+            {
+                "role": msg.role,
+                "content": msg.content or "",
+                "created_at": msg.created_at.isoformat(),
+            }
+            for msg in conversation.messages
+            if msg.role in ("user", "assistant")
+        ],
+    }
+
+
 @router.delete("/conversations/{conversation_id}")
 async def delete_conversation(
     conversation_id: str,
@@ -207,6 +242,7 @@ async def chat_completion(
         user_permissions=user_permissions,
         db=db,
         has_documents=True,
+        user_id=current_user.id,
     )
 
     # Build grounded context: conversation history + evidence
@@ -221,6 +257,10 @@ async def chat_completion(
         for cite in plan.knowledge_evidence:
             all_citations.append(cite)
             evidence_parts.append(f"- {cite.citation}: {cite.passage or cite.title}")
+        evidence_parts.append("---")
+    elif plan.knowledge_plan and plan.knowledge_plan.get("mode") == "catalog":
+        evidence_parts.append("=== Authorized Document Catalog ===")
+        evidence_parts.append("No documents are currently available to this user.")
         evidence_parts.append("---")
 
     if plan.structured_evidence:
