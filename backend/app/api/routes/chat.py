@@ -22,10 +22,14 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import get_current_user
 from app.api.schemas.common import ChatCompletionRequest, ChatMessage, ChatResponse, AnswerRecord, Citation
+from app.auth.service import auth_service
 from app.core.audit import AuditEventType, audit_context
+from app.core.config import settings
 from app.db.connection import get_db
 from app.db.models import Conversation, Message
+from app.orchestrator import get_orchestrator
 from app.providers.factory import create_provider, get_default_provider
+from app.providers.base import ProcessingLocation, ProviderError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
@@ -59,6 +63,29 @@ async def list_conversations(
         }
         for c in conversations
     ]
+
+
+def _build_system_prompt(execution_class, evidence_text: str | None = None) -> str:
+    """Build a system prompt based on the execution class and available evidence."""
+    base = "You are OpenJM Enterprise AI, a governed enterprise assistant. Answer questions based on evidence when available, and cite your sources."
+
+    if evidence_text:
+        base += chr(10) + chr(10) + "=== Context Evidence ===" + chr(10)
+        base += evidence_text + chr(10)
+        base += "=== End Evidence ===" + chr(10) + chr(10)
+        base += "When answering, cite specific evidence. If no relevant evidence is found, say so."
+
+    exec_val = execution_class.value
+    if exec_val == "structured":
+        base += chr(10) + chr(10) + "This request is classified as Structured Data: answer only from the provided database evidence. Do not hallucinate values."
+    elif exec_val == "knowledge":
+        base += chr(10) + chr(10) + "This request is classified as Knowledge: ground your answer in the provided document evidence with citations."
+    elif exec_val == "hybrid":
+        base += chr(10) + chr(10) + "This request is classified as Hybrid: combine both document and structured data evidence. Cite each evidence source."
+    elif exec_val == "general":
+        base += chr(10) + chr(10) + "This request is classified as General: no enterprise evidence retrieval is required."
+
+    return base
 
 
 @router.post("/conversations")
@@ -123,7 +150,6 @@ async def chat_completion(
         provider = create_provider(provider_name)
 
     # Check privacy policy: reject remote in local-only mode
-    from app.providers.base import ProcessingLocation
     location = provider.get_processing_location()
     if location != ProcessingLocation.LOCAL:
         raise HTTPException(
@@ -161,24 +187,67 @@ async def chat_completion(
         db.add(conversation)
         await db.flush()
 
-    # Build messages for provider
-    messages_for_provider: list[dict] = []
-
-    # Load historical messages explicitly (avoids async lazy-load errors)
-    # Only load for existing conversations, not freshly created ones
-    if chat_request.conversation_id:
-        msg_stmt = select(Message).where(
-            Message.conversation_id == conv_id,
-        ).order_by(Message.created_at)
-        msg_result = await db.execute(msg_stmt)
-        for msg in msg_result.scalars().all():
-            messages_for_provider.append({
-                "role": msg.role,
-                "content": msg.content,
-            })
-
-    # Add the new user message
+    # Build messages for provider — integrate orchestrator for evidence
     user_msg_content = chat_request.messages[-1].content if chat_request.messages else ""
+    user_permissions = list(await auth_service.get_user_permission_codes(db, current_user))
+
+    # Run the orchestrator: classify intent + retrieve evidence (RAG + SQL)
+    from app.orchestrator import ExecutionClass, truncate_context
+
+    # Load conversation history for context
+    if conv_id and chat_request.conversation_id:
+        context_messages = [{"role": msg.role, "content": msg.content}
+                           for msg in conversation.messages]
+    else:
+        context_messages = []
+
+    # Classify and retrieve evidence
+    plan = await get_orchestrator().plan(
+        user_message=user_msg_content,
+        user_permissions=user_permissions,
+        db=db,
+        has_documents=True,
+    )
+
+    # Build grounded context: conversation history + evidence
+    context_messages = truncate_context(context_messages, plan.max_context_tokens)
+
+    # Inject evidence as system context
+    evidence_parts: list[str] = []
+    all_citations: list[Citation] = []
+
+    if plan.knowledge_evidence:
+        evidence_parts.append("=== Knowledge Evidence (from documents) ===")
+        for cite in plan.knowledge_evidence:
+            all_citations.append(cite)
+            evidence_parts.append(f"- {cite.citation}: {cite.passage or cite.title}")
+        evidence_parts.append("---")
+
+    if plan.structured_evidence:
+        evidence_parts.append("=== Structured Data Evidence ===")
+        for cite in plan.structured_evidence:
+            all_citations.append(cite)
+            evidence_parts.append(f"- {cite.citation}: {cite.passage}")
+        evidence_parts.append("---")
+
+    # Build the system prompt with evidence and instructions
+    system_prompt = _build_system_prompt(
+        execution_class=plan.execution_class,
+        evidence_text="\n".join(evidence_parts) if evidence_parts else None,
+    )
+
+    # Build messages for provider: system prompt + context + user message
+    messages_for_provider: list[dict] = []
+    if system_prompt:
+        messages_for_provider.append({"role": "system", "content": system_prompt})
+    # Add conversation history (user/assistant turns)
+    for msg in context_messages:
+        if msg["role"] in ("user", "assistant"):
+            messages_for_provider.append(msg)
+    # Add the new user message
+    messages_for_provider.append({"role": "user", "content": user_msg_content})
+
+    # Save user message
     user_msg = Message(
         id=str(uuid.uuid4()),
         conversation_id=conv_id,
@@ -190,15 +259,6 @@ async def chat_completion(
         created_at=datetime.now(timezone.utc),
     )
     db.add(user_msg)
-    messages_for_provider.append({"role": "user", "content": user_msg_content})
-
-    # Get model capabilities
-    caps = await provider.get_capabilities()
-    if not caps.verified:
-        raise HTTPException(
-            status_code=503,
-            detail="Provider capabilities not verified. Check provider configuration.",
-        )
 
     # Audit log
     async with audit_context(db) as audit:
@@ -210,26 +270,38 @@ async def chat_completion(
             model=provider.config.model,
             processing_location=location.value,
             outcome="started",
+            details={
+                "execution_class": plan.execution_class.value,
+                "evidence_count": len(all_citations),
+            },
+        )
+
+    # Get model capabilities
+    caps = await provider.get_capabilities()
+    if not caps.verified:
+        raise HTTPException(
+            status_code=503,
+            detail="Provider capabilities not verified. Check provider configuration.",
         )
 
     # Stream or non-stream response
     if chat_request.stream:
         return await _stream_chat(
             provider, messages_for_provider, conversation, db, current_user,
-            request, audit, caps,
+            request, audit, caps, plan, all_citations,
         )
     else:
         return await _non_stream_chat(
             provider, messages_for_provider, conversation, db, current_user,
-            request, audit, caps,
+            request, audit, caps, plan, all_citations,
         )
 
 
 async def _non_stream_chat(
     provider, messages, conversation, db, current_user,
-    request, audit, caps,
+    request, audit, caps, plan, all_citations,
 ):
-    """Non-streaming chat completion."""
+    """Non-streaming chat completion with orchestrator evidence."""
     try:
         result = await provider.chat(
             messages,
@@ -264,16 +336,19 @@ async def _non_stream_chat(
                 model=result.model or provider.config.model,
                 processing_location=result.processing_location.value,
                 outcome="success",
+                details={
+                    "evidence_count": len(all_citations),
+                    "execution_class": plan.execution_class.value if plan else "unknown",
+                },
             )
 
-        from app.api.schemas.common import AnswerRecord, Citation
         return ChatResponse(
             response_type="content",
             delta=None,
             answer=AnswerRecord(
                 final_answer=result.content,
                 completion_status="completed",
-                evidence=[],
+                evidence=all_citations,
                 assumptions=[],
                 truncation_info=None,
                 processing_location=result.processing_location.value,
@@ -283,14 +358,15 @@ async def _non_stream_chat(
             ),
             finish_reason=result.finish_reason,
             message=ChatMessage(role="assistant", content=result.content),
+            conversation_id=conversation.id,
+        )
+    except ProviderError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider error: {e.code}: {e.message}",
         )
     except Exception as e:
-        from app.providers.base import ProviderError
-        if isinstance(e, ProviderError):
-            raise HTTPException(
-                status_code=502,
-                detail=f"Provider error: {e.code}: {e.message}",
-            )
+        logger.error(f"Chat completion failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail="Error processing chat request",
@@ -299,9 +375,9 @@ async def _non_stream_chat(
 
 async def _stream_chat(
     provider, messages, conversation, db, current_user,
-    request, audit, caps,
+    request, audit, caps, plan, all_citations,
 ):
-    """Streaming chat completion."""
+    """Streaming chat completion with orchestrator evidence."""
     async def generate():
         full_content = ""
         try:
@@ -317,7 +393,14 @@ async def _stream_chat(
                 if chunk.finish_reason:
                     break
 
-            yield f"data: {json.dumps({'response_type': 'done'})}\n\n"
+            # Send evidence with the done event
+            evidence_data = [
+                {"source_type": c.source_type, "source_id": c.source_id,
+                 "title": c.title or "", "passage": c.passage,
+                 "citation": c.citation, "confidence": c.confidence}
+                for c in all_citations
+            ]
+            yield f"data: {json.dumps({'response_type': 'done', 'evidence': evidence_data, 'conversation_id': conversation.id})}\n\n"
 
             # Save assistant message
             assistant_msg = Message(
@@ -337,5 +420,3 @@ async def _stream_chat(
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-
-from app.core.config import settings

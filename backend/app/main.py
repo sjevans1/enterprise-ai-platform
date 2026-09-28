@@ -97,14 +97,10 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-# Mount static files for frontend (if built)
-import os
-static_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
-if os.path.isdir(static_path):
-    app.mount("/", StaticFiles(directory=static_path, html=True), name="frontend")
-
-
-# Register routers
+# Register routers FIRST — before the static file mount.
+# StaticFiles mounted at "/" would otherwise shadow /api/v1/* routes
+# when the frontend/dist directory exists (it catches 404s and serves
+# index.html as fallback, intercepting requests meant for the API).
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(bootstrap.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")
@@ -112,6 +108,12 @@ app.include_router(chat.router, prefix="/api/v1")
 app.include_router(jobs.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
 app.include_router(structured_data.router, prefix="/api/v1")
+
+# Mount static files for frontend (if built) — AFTER routers so API routes win
+import os
+static_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
+if os.path.isdir(static_path):
+    app.mount("/", StaticFiles(directory=static_path, html=True), name="frontend")
 
 
 @app.exception_handler(Exception)

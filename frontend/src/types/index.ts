@@ -53,8 +53,10 @@ export interface ChatRequest {
   messages: ChatMessage[]
   model?: string
   provider?: string
+  stream?: boolean
   temperature?: number
   max_tokens?: number
+  conversation_id?: string | null
 }
 
 export interface ChatResponse {
@@ -73,6 +75,7 @@ export interface ChatResponse {
     execution_timestamp: string
   }
   finish_reason: string
+  conversation_id?: string | null
 }
 
 // ─── Conversation types ────────────────────────────────────────────

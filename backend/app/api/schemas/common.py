@@ -82,6 +82,7 @@ class ChatResponse(BaseModel):
     delta: str | None = None  # for streaming
     answer: AnswerRecord | None = None
     finish_reason: str | None = None
+    conversation_id: str | None = None  # returned so client can maintain continuity
 
 
 # ── DataSource schemas ───────────────────────────────────────

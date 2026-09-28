@@ -100,13 +100,16 @@ async def get_schema(
 ):
     """List tables and their metadata in the customer database.
 
+    Uses the customer database connector's engine — NOT the platform's
+    application database session (AsyncSessionLocal).
+
     **Required permissions:** ``sql:schema``
     """
-    from sqlalchemy import text, inspect
-    from app.db.connection import AsyncSessionLocal
+    from sqlalchemy import text
 
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
+    with connector.engine.connect() as conn:
+        # Get table names from the customer database
+        result = conn.execute(
             text("""
                 SELECT table_name
                 FROM information_schema.tables
@@ -120,15 +123,22 @@ async def get_schema(
 
         table_infos = []
         for tname in tables:
-            count_result = await session.execute(
-                text("SELECT reltuples::bigint FROM pg_class WHERE relname = :t"),
-                {"t": tname},
+            # Get column count AND row estimate in a single query
+            count_result = conn.execute(
+                text("""
+                    SELECT 
+                        (SELECT COUNT(*) FROM information_schema.columns
+                         WHERE table_name = :t AND table_schema = :schema) as col_count,
+                        (SELECT reltuples::bigint FROM pg_class 
+                         WHERE relname = :t) as row_est
+                """),
+                {"t": tname, "schema": connector.schema},
             )
-            row_est = count_result.fetchone()
+            row = count_result.fetchone()
             table_infos.append(TableInfo(
                 table_name=tname,
-                column_count=0,
-                row_estimate=row_est[0] if row_est else None,
+                column_count=row[0] if row else 0,
+                row_estimate=row[1] if row else None,
             ))
 
     return SchemaResponse(

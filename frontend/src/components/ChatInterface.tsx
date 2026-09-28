@@ -7,6 +7,9 @@ import { Send, Loader2, Copy } from 'lucide-react'
 export default function ChatInterface() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
+  const [conversationId, setConversationId] = useState<string | null>(() => {
+    return localStorage.getItem('conversationId')
+  })
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const queryClient = useQueryClient()
 
@@ -18,11 +21,19 @@ export default function ChatInterface() {
     scrollToBottom()
   }, [messages])
 
+  // Persist conversationId to localStorage
+  useEffect(() => {
+    if (conversationId) {
+      localStorage.setItem('conversationId', conversationId)
+    }
+  }, [conversationId])
+
   const sendMessage = useMutation({
     mutationFn: async (msg: string) => {
       const res = await api.post<ChatResponse>('/chat', {
         messages: [...messages, { role: 'user', content: msg }],
         stream: false,
+        conversation_id: conversationId,
       })
       return res.data
     },
@@ -32,6 +43,10 @@ export default function ChatInterface() {
       setInput('')
     },
     onSuccess: (data) => {
+      // Store conversation_id from response
+      if (data.conversation_id) {
+        setConversationId(data.conversation_id)
+      }
       const assistantMsg: ChatMessage = {
         role: 'assistant',
         content: data.answer.final_answer || data.message.content,
