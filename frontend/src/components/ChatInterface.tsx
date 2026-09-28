@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation } from '@tanstack/react-query'
 import api from '../services/api'
 import type { ChatMessage, ChatResponse } from '../types'
 import { Send, Loader2, Copy } from 'lucide-react'
@@ -11,7 +11,6 @@ export default function ChatInterface() {
     return localStorage.getItem('conversationId')
   })
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const queryClient = useQueryClient()
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -25,6 +24,30 @@ export default function ChatInterface() {
   useEffect(() => {
     if (conversationId) {
       localStorage.setItem('conversationId', conversationId)
+    }
+  }, [conversationId])
+
+  // Restore persisted server-side history after a reload.
+  useEffect(() => {
+    if (!conversationId) return
+
+    let cancelled = false
+    api.get<{ messages: ChatMessage[] }>(`/conversations/${conversationId}/messages`)
+      .then((res) => {
+        if (!cancelled) setMessages(res.data.messages)
+      })
+      .catch((error) => {
+        if (error.response?.status === 404) {
+          localStorage.removeItem('conversationId')
+          if (!cancelled) {
+            setConversationId(null)
+            setMessages([])
+          }
+        }
+      })
+
+    return () => {
+      cancelled = true
     }
   }, [conversationId])
 
