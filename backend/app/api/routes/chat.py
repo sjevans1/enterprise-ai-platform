@@ -207,6 +207,7 @@ async def chat_completion(
         user_permissions=user_permissions,
         db=db,
         has_documents=True,
+        user_id=current_user.id,
     )
 
     # Build grounded context: conversation history + evidence
@@ -221,6 +222,10 @@ async def chat_completion(
         for cite in plan.knowledge_evidence:
             all_citations.append(cite)
             evidence_parts.append(f"- {cite.citation}: {cite.passage or cite.title}")
+        evidence_parts.append("---")
+    elif plan.knowledge_plan and plan.knowledge_plan.get("mode") == "catalog":
+        evidence_parts.append("=== Authorized Document Catalog ===")
+        evidence_parts.append("No documents are currently available to this user.")
         evidence_parts.append("---")
 
     if plan.structured_evidence:
