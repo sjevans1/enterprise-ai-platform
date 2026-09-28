@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────
+# Docker Compose — Development Overlay
+# Run with: docker compose -f compose/docker-compose.yml -f compose/docker-compose.dev.yml up -d
+# ─────────────────────────────────────────────────────────────────────
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_dev}
+
+  api:
+    build:
+      target: application
+    volumes:
+      - ./backend/app:/app/app:ro
+      - ./backend/init_db.py:/app/init_db.py:ro
+      - ./backend/.data:/app/.data
+      - ./backend/.cache:/app/.cache
+    environment:
+      APP_ENV: development
+      DEBUG: "true"
+      POSTGRES_HOST: postgres
+      APP_PORT: 8000
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  worker:
+    volumes:
+      - ./backend/app:/app/app:ro
+      - ./backend/init_db.py:/app/init_db.py:ro
+      - ./backend/.data:/app/.data
+      - ./backend/.cache:/app/.cache

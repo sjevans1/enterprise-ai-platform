@@ -1,0 +1,177 @@
+# ─────────────────────────────────────────────────────────────────────
+# Enterprise AI & RAG Platform — Docker Compose
+# MVP deployment: PostgreSQL 17 + pgvector, FastAPI backend, job worker
+# ─────────────────────────────────────────────────────────────────────
+# Usage:
+#   docker compose -f compose/docker-compose.yml up -d
+#   docker compose -f compose/docker-compose.yml --env-file .env up -d
+#   docker compose -f compose/docker-compose.yml logs -f
+# ─────────────────────────────────────────────────────────────────────
+services:
+  # ── PostgreSQL with pgvector ───────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: eai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: enterprise_ai
+      POSTGRES_USER: ${POSTGRES_USER:-app_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_dev}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app_admin} -d enterprise_ai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - eai-net
+
+  # ── Backend API ────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: eai-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Application
+      - APP_ENV=${APP_ENV:-production}
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - DEBUG=${DEBUG:-false}
+      # Database (connect to postgres service)
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=enterprise_ai
+      - POSTGRES_USER=${POSTGRES_USER:-app_admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme_dev}
+      - POSTGRES_POOL_SIZE=${POSTGRES_POOL_SIZE:-20}
+      - POSTGRES_MAX_OVERFLOW=${POSTGRES_MAX_OVERFLOW:-40}
+      # Security — MUST override in production
+      - MASTER_KEY=${MASTER_KEY:-dev-master-key-change-in-production-32bytes!}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-jwt-secret-change-in-production}
+      - JWT_ALGORITHM=HS256
+      - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES:-480}
+      - JWT_REFRESH_EXPIRE_MINUTES=${JWT_REFRESH_EXPIRE_MINUTES:-43200}
+      - MIN_PASSWORD_LENGTH=${MIN_PASSWORD_LENGTH:-12}
+      # Model Gateway — set PROVIDER and API key
+      - DEFAULT_PROVIDER=${DEFAULT_PROVIDER:-hermes}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-hermes-agent}
+      - HERMES_API_BASE=${HERMES_API_BASE:-http://host.docker.internal:8642/v1}
+      - HERMES_API_KEY=${HERMES_API_KEY}
+      - OLLAMA_API_BASE=${OLLAMA_API_BASE:-http://ollama:11434/v1}
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma:2b}
+      - OPENAI_COMPATIBLE_BASE=${OPENAI_COMPATIBLE_BASE}
+      - OPENAI_COMPATIBLE_KEY=${OPENAI_COMPATIBLE_KEY}
+      - OPENAI_COMPATIBLE_MODEL=${OPENAI_COMPATIBLE_MODEL}
+      - REMOTE_MODEL_ALLOWED=${REMOTE_MODEL_ALLOWED:-false}
+      # Embedding (CPU-only)
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-V2}
+      - EMBEDDING_DIMENSIONS=384
+      # CORS
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000,http://localhost:8000}
+      # Structured Data Query
+      - STRUCTURED_DATA_DB_URL=${STRUCTURED_DATA_DB_URL}
+      - STRUCTURED_DATA_SCHEMA=${STRUCTURED_DATA_SCHEMA:-public}
+      - STRUCTURED_DATA_MAX_ROWS=${STRUCTURED_DATA_MAX_ROWS:-1000}
+      - STRUCTURED_DATA_QUERY_TIMEOUT=${STRUCTURED_DATA_QUERY_TIMEOUT:-30}
+      # Job queue
+      - JOB_MAX_RETRIES=${JOB_MAX_RETRIES:-3}
+      - JOB_TIMEOUT_SECONDS=${JOB_TIMEOUT_SECONDS:-600}
+      # Audit
+      - AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS:-365}
+      - FULL_PROMPT_LOGGING_ENABLED=${FULL_PROMPT_LOGGING_ENABLED:-false}
+    volumes:
+      - ./backend/.data:/app/.data
+      - ./backend/.cache:/app/.cache
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - eai-net
+
+  # ── Background Job Worker (same image, different entrypoint) ───────
+  worker:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: eai-worker
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # Same environment as api (minus API-specific vars)
+      - APP_ENV=${APP_ENV:-production}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=enterprise_ai
+      - POSTGRES_USER=${POSTGRES_USER:-app_admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme_dev}
+      - MASTER_KEY=${MASTER_KEY:-dev-master-key-change-in-production-32bytes!}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-jwt-secret-change-in-production}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-V2}
+      - STRUCTURED_DATA_DB_URL=${STRUCTURED_DATA_DB_URL}
+      - STRUCTURED_DATA_SCHEMA=${STRUCTURED_DATA_SCHEMA:-public}
+      - STRUCTURED_DATA_MAX_ROWS=${STRUCTURED_DATA_MAX_ROWS:-1000}
+      - STRUCTURED_DATA_QUERY_TIMEOUT=${STRUCTURED_DATA_QUERY_TIMEOUT:-30}
+      - HERMES_API_BASE=${HERMES_API_BASE:-http://host.docker.internal:8642/v1}
+      - HERMES_API_KEY=${HERMES_API_KEY}
+      - OLLAMA_API_BASE=${OLLAMA_API_BASE:-http://ollama:11434/v1}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma:2b}
+      - DEFAULT_PROVIDER=${DEFAULT_PROVIDER:-hermes}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-hermes-agent}
+      - REMOTE_MODEL_ALLOWED=${REMOTE_MODEL_ALLOWED:-false}
+    command: ["python", "-m", "app.jobs.runner", "--poll-interval", "2", "--lock-ttl", "300", "--max-concurrent", "2"]
+    volumes:
+      - ./backend/.data:/app/.data
+      - ./backend/.cache:/app/.cache
+    networks:
+      - eai-net
+
+  # ── Frontend (React + Vite, served by nginx) ──────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    container_name: eai-frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    networks:
+      - eai-net
+
+  # ── Ollama (optional local model inference) ────────────────────────
+  # Enable by running: docker compose -f compose/docker-compose.yml --profile inference up -d
+  ollama:
+    image: ollama/ollama:latest
+    container_name: eai-ollama
+    restart: unless-stopped
+    profiles: ["inference"]
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - eai-net
+
+volumes:
+  pgdata:
+  ollama-data:
+
+networks:
+  eai-net:
+    driver: bridge

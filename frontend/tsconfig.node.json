@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "moduleResolution": "Node",
+    "module": "ESNext",
+    "noEmit": true
+  },
+  "include": ["src"]
+}

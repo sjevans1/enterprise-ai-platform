@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-primary: 0 73 102;
+    --color-primary-hover: 0 58 82;
+    --color-secondary: 100 100 100;
+    --color-accent: 245 158 11;
+    --color-accent-hover: 217 119 6;
+  }
+
+  html {
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+
+  body {
+    @apply bg-white text-gray-900 antialiased;
+  }
+
+  /* Exact mobile parity — no separate mobile layout */
+  .desktop-and-mobile {
+    width: 100%;
+  }
+}

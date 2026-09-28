@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Data directories (runtime data, not source)
+backend/.data/
+backend/.cache/
+frontend/node_modules/
+infra/pgdata/
+
+# Logs
+*.log
+server.log
+pg.log
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+*.pid
