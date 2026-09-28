@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas.common import Citation, ProcessingLocation
 from app.documents.schemas import RetrievalResult
-from app.db.models import DocumentPermission
+from app.db.models import Document, DocumentPermission, UserRole
 from app.retrieval.service import RetrievalService
 from app.connectors.sql import SQLConnector, SQLValidationError, get_sql_connector, reset_sql_connector
 
@@ -96,6 +96,22 @@ _SQL_INDICATORS = {
     "group by", "order by", "join", "table", "query",
 }
 
+_DOCUMENT_CATALOG_PATTERNS = (
+    "what documents do you have",
+    "what documents are loaded",
+    "what documents are available",
+    "which documents do you have",
+    "which documents are loaded",
+    "which documents are available",
+    "list documents",
+    "list the documents",
+    "show documents",
+    "show me the documents",
+    "what files do you have",
+    "what files are loaded",
+    "what files are available",
+)
+
 
 class Orchestrator:
     """Request classification and evidence planning.
@@ -122,6 +138,16 @@ class Orchestrator:
         knowledge_strong = any(kw in query_lower for kw in _KNOWLEDGE_STRONG)
         structured_score = sum(1 for kw in _STRUCTURED_KEYWORDS if kw in query_lower)
         sql_score = sum(1 for kw in _SQL_INDICATORS if kw in query_lower)
+
+        # Document inventory is a catalog lookup, not semantic vector search.
+        if has_documents and any(pattern in query_lower for pattern in _DOCUMENT_CATALOG_PATTERNS):
+            return ExecutionPlan(
+                execution_class=ExecutionClass.KNOWLEDGE,
+                confidence=0.98,
+                rationale="Authorized document catalog request",
+                knowledge_plan={"enabled": True, "mode": "catalog", "top_k": 100},
+                structured_plan={"enabled": False},
+            )
 
         # Structured-data path: SQL indicators or strong structured keywords
         if sql_score >= 2 or structured_score >= 2:
@@ -170,6 +196,7 @@ class Orchestrator:
         user_permissions: list[str],
         db: AsyncSession,
         has_documents: bool = True,
+        user_id: str | None = None,
     ) -> ExecutionPlan:
         """Full planning: classify + execute evidence retrieval.
 
@@ -182,7 +209,7 @@ class Orchestrator:
         tasks = []
         if plan.knowledge_plan and plan.knowledge_plan.get("enabled"):
             tasks.append(("knowledge", self._retrieve_knowledge(
-                plan, user_message, user_permissions, db
+                plan, user_message, user_permissions, db, user_id=user_id
             )))
         if plan.structured_plan and plan.structured_plan.get("enabled"):
             tasks.append(("structured", self._retrieve_structured(
@@ -207,9 +234,17 @@ class Orchestrator:
         query: str,
         user_permissions: list[str],
         db: AsyncSession,
+        user_id: str | None = None,
     ) -> list[Citation]:
         """Retrieve knowledge evidence with permission filtering."""
         try:
+            if plan.knowledge_plan and plan.knowledge_plan.get("mode") == "catalog":
+                return await self._retrieve_document_catalog(
+                    user_permissions=user_permissions,
+                    db=db,
+                    user_id=user_id,
+                )
+
             retrieval = RetrievalService(db_session=db)
             top_k = plan.knowledge_plan.get("top_k", 8)
 
@@ -222,7 +257,9 @@ class Orchestrator:
             # has access to (document_permissions table)
             filtered: list[RetrievalResult] = []
             for r in results:
-                if await self._check_document_access(r.document_id, user_permissions, db):
+                if await self._check_document_access(
+                    r.document_id, user_permissions, db, user_id=user_id
+                ):
                     filtered.append(r)
 
             citations: list[Citation] = []
@@ -322,29 +359,88 @@ class Orchestrator:
             logger.warning(f"Structured query failed: {e}")
             return []
 
-    async def _check_document_access(
-        self, document_id: str, user_permissions: list[str], db: AsyncSession
-    ) -> bool:
-        """Check if the user has access to a document.
+    async def _retrieve_document_catalog(
+        self,
+        user_permissions: list[str],
+        db: AsyncSession,
+        user_id: str | None = None,
+    ) -> list[Citation]:
+        """Return the authorized document inventory as evidence.
 
-        Uses the document_permissions table. If no explicit permissions
-        exist for this document, falls back to document:read permission.
+        A catalog question such as "what documents do you have loaded?" must
+        inspect document metadata directly. Vector similarity search is the
+        wrong primitive for inventory questions because a filename may have
+        no semantic similarity to the user's wording.
+        """
+        stmt = (
+            select(Document)
+            .where(Document.deleted_at.is_(None))
+            .order_by(Document.created_at.desc())
+        )
+        result = await db.execute(stmt)
+        documents = result.scalars().all()
+
+        citations: list[Citation] = []
+        for doc in documents:
+            if not await self._check_document_access(
+                doc.id, user_permissions, db, user_id=user_id
+            ):
+                continue
+            status_value = getattr(doc.status, "value", str(doc.status))
+            passage = (
+                f"Filename: {doc.original_name}; status: {status_value}; "
+                f"indexed: {bool(doc.is_indexed)}; source: {doc.source_type}"
+            )
+            citations.append(Citation(
+                source_type="document_catalog",
+                source_id=doc.id,
+                title=doc.original_name,
+                passage=passage,
+                citation=f"Document catalog:{doc.id[:8]}",
+                confidence=1.0,
+            ))
+        return citations
+
+    async def _check_document_access(
+        self,
+        document_id: str,
+        user_permissions: list[str],
+        db: AsyncSession,
+        user_id: str | None = None,
+    ) -> bool:
+        """Check whether this caller may read a document.
+
+        document:read is treated as a platform-wide read grant (for example,
+        the administrator role). Otherwise explicit public, user, or role
+        grants in document_permissions are required.
         """
         if "document:read" in user_permissions:
             return True
 
         stmt = select(DocumentPermission).where(
             DocumentPermission.document_id == document_id,
+            DocumentPermission.permission == "read",
         )
         result = await db.execute(stmt)
         perms = result.scalars().all()
-
-        # If no explicit permissions, allow with document:read
         if not perms:
-            return "document:read" in user_permissions
+            return False
 
-        # Check each permission — in practice this would check role mappings
-        return any(p.document_id == document_id for p in perms)
+        role_ids: set[str] = set()
+        if user_id:
+            role_result = await db.execute(
+                select(UserRole.role_id).where(UserRole.user_id == user_id)
+            )
+            role_ids = set(role_result.scalars().all())
+
+        for perm in perms:
+            if perm.grantee_type == "public":
+                return True
+            if user_id and perm.grantee_type == "user" and perm.grantee_id == user_id:
+                return True
+            if perm.grantee_type == "role" and perm.grantee_id in role_ids:
+                return True
+        return False
 
 
 def get_processing_location_value(provider_location: str) -> str:
