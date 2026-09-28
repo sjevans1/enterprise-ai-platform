@@ -34,6 +34,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(null)
       localStorage.removeItem('access_token')
       localStorage.removeItem('refresh_token')
+      localStorage.removeItem('conversationId')
     }
     window.addEventListener('auth:logout', handleLogout)
     return () => window.removeEventListener('auth:logout', handleLogout)
@@ -43,6 +44,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const res = await api.post<LoginResponse>('/auth/login', data)
     localStorage.setItem('access_token', res.data.access_token)
     localStorage.setItem('refresh_token', res.data.refresh_token)
+    localStorage.removeItem('conversationId')
     setUser(res.data.user)
   }
 
@@ -52,6 +54,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }).catch(() => {})
     localStorage.removeItem('access_token')
     localStorage.removeItem('refresh_token')
+    localStorage.removeItem('conversationId')
     setUser(null)
   }
 
